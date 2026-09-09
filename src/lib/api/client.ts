@@ -18,19 +18,24 @@ export class ApiError extends Error {
   }
 }
 
-// Single-flight refresh: if a refresh is already in progress, every
-// caller awaits the SAME promise instead of firing their own request.
-let refreshPromise: Promise<string | null> | null = null;
+// Single-flight refresh: concurrent 401s from the same session share one
+// `/auth/refresh` call. The in-flight promise is keyed to the store version it
+// started at, so a refresh begun for a previous session is never handed to a
+// newer one — a fresh login must trigger its own refresh.
+let inFlightRefresh: { version: number; promise: Promise<string | null> } | null = null;
 
 export async function refreshAccessToken(): Promise<string | null> {
-  if (refreshPromise) return refreshPromise;
-
   // Snapshot the store version now. If a logout or login writes to the store
   // while this request is in flight, the compare-and-set below is rejected so
   // we never restore a superseded session.
   const startVersion = tokenStore.getVersion();
 
-  refreshPromise = (async () => {
+  // Reuse an in-flight refresh only if it began under the current token state.
+  if (inFlightRefresh && inFlightRefresh.version === startVersion) {
+    return inFlightRefresh.promise;
+  }
+
+  const promise = (async () => {
     try {
       const res = await fetch(`${API_BASE}/auth/refresh`, {
         method: "POST",
@@ -38,8 +43,10 @@ export async function refreshAccessToken(): Promise<string | null> {
       });
 
       if (!res.ok) {
-        tokenStore.setIfVersion(startVersion, null);
-        return null;
+        const applied = tokenStore.setIfVersion(startVersion, null);
+        // A newer login/logout already superseded us: leave its token in place
+        // and let the 401 retry use the live session rather than failing.
+        return applied ? null : tokenStore.get();
       }
 
       const data = await res.json();
@@ -48,14 +55,18 @@ export async function refreshAccessToken(): Promise<string | null> {
       // token so a 401 retry uses the live session rather than our stale one.
       return applied ? (data.accessToken as string) : tokenStore.get();
     } catch {
-      tokenStore.setIfVersion(startVersion, null);
-      return null;
+      const applied = tokenStore.setIfVersion(startVersion, null);
+      return applied ? null : tokenStore.get();
     } finally {
-      refreshPromise = null; // clear so the NEXT 401 can trigger a fresh refresh
+      // Clear only if this is still the current entry — a newer session may
+      // have replaced it. Successive entries have strictly increasing, unique
+      // versions, so this comparison is unambiguous.
+      if (inFlightRefresh?.version === startVersion) inFlightRefresh = null;
     }
   })();
 
-  return refreshPromise;
+  inFlightRefresh = { version: startVersion, promise };
+  return promise;
 }
 
 interface RequestOptions extends RequestInit {

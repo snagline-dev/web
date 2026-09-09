@@ -129,8 +129,59 @@ describe("refreshAccessToken — stale completion must not restore a superseded 
     tokenStore.set("new-login-token");
 
     resolveRefresh(new Response(null, { status: 401 })); // refresh fails
-    await pending;
+    await expect(pending).resolves.toBe("new-login-token");
 
+    expect(tokenStore.get()).toBe("new-login-token");
+  });
+});
+
+describe("refreshAccessToken — a newer session must not inherit a previous session's refresh", () => {
+  it("issues a fresh refresh for the current session instead of reusing a stale in-flight one", async () => {
+    tokenStore.set("old-token");
+
+    let refreshCount = 0;
+    let resolveFirstRefresh: (res: Response) => void = () => {};
+    const fetchMock = vi.fn((url: string) => {
+      if (url.toString().includes("/auth/refresh")) {
+        refreshCount += 1;
+        if (refreshCount === 1) {
+          return new Promise<Response>((resolve) => (resolveFirstRefresh = resolve));
+        }
+        return Promise.resolve(jsonResponse({ accessToken: "newer-refreshed" }));
+      }
+      return tokenStore.get() === "newer-refreshed"
+        ? Promise.resolve(jsonResponse({ ok: true }))
+        : Promise.resolve(new Response(null, { status: 401 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const stalled = refreshAccessToken(); // previous session, still pending
+    tokenStore.set("new-login-token"); // new login lands while it's pending
+
+    const result = await apiFetch<{ ok: boolean }>("/widgets");
+
+    expect(result).toEqual({ ok: true });
+    expect(refreshCount).toBe(2); // new session did NOT wait on the stale refresh
+    expect(tokenStore.get()).toBe("newer-refreshed");
+
+    resolveFirstRefresh(new Response(null, { status: 401 }));
+    await stalled.catch(() => {});
+  });
+
+  it("resolves to the live token (not null) when a superseded refresh fails", async () => {
+    tokenStore.set("old-token");
+
+    let resolveRefresh: (res: Response) => void = () => {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise<Response>((resolve) => (resolveRefresh = resolve))),
+    );
+
+    const pending = refreshAccessToken();
+    tokenStore.set("new-login-token"); // newer login supersedes
+    resolveRefresh(new Response(null, { status: 401 })); // old refresh fails
+
+    await expect(pending).resolves.toBe("new-login-token");
     expect(tokenStore.get()).toBe("new-login-token");
   });
 });
